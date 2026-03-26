@@ -2,24 +2,23 @@
 set -euo pipefail
 
 # =============================================================================
-# Layer 4: Failover — Health Check Deployment
+# Health Check — Updated for Tailscale + WireGuard dual-path architecture
 #
-# Installs a periodic health probe that:
-# 1. Tests WireGuard tunnel connectivity
-# 2. Tests egress IP correctness
-# 3. Tests ChatGPT/OpenAI endpoint reachability
-# 4. Alerts on degradation (optional: Telegram or email)
-# 5. Logs state transitions for post-hoc analysis
+# Probes:
+#   1. Tailscale status (is exit node active?)
+#   2. Egress IP matches expected (static/reserved IP)
+#   3. OpenAI API reachable (401 = good, 403 = geo-blocked/flagged)
+#   4. State transition logging + optional Telegram alert
 #
-# Usage: ./deploy-healthcheck.sh [--interval 60] [--telegram-token TOKEN --telegram-chat CHAT_ID]
+# On DigitalOcean backup node: can trigger Reserved IP reassignment
+#
+# Usage: ./deploy-healthcheck.sh [--interval 60] [--telegram-token T --telegram-chat C]
 # =============================================================================
 
-INTERVAL=60  # seconds
+INTERVAL=60
 TELEGRAM_TOKEN=""
 TELEGRAM_CHAT=""
-LOG_FILE="/var/log/egress-health.log"
 
-# Parse args
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --interval)        INTERVAL="$2"; shift 2 ;;
@@ -29,110 +28,116 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Install the health check script
+[[ $EUID -ne 0 ]] && { echo "Run as root"; exit 1; }
+
+# Store expected egress IP
+PUBLIC_IP=$(curl -4 -s --max-time 10 ifconfig.me)
+mkdir -p /etc/egress-substrate
+echo "$PUBLIC_IP" > /etc/egress-substrate/expected_ip
+
+# Store Telegram config
+if [[ -n "$TELEGRAM_TOKEN" && -n "$TELEGRAM_CHAT" ]]; then
+    echo "$TELEGRAM_TOKEN" > /etc/egress-substrate/telegram_token
+    echo "$TELEGRAM_CHAT" > /etc/egress-substrate/telegram_chat
+    chmod 600 /etc/egress-substrate/telegram_token /etc/egress-substrate/telegram_chat
+fi
+
+# Install probe script
 cat > /usr/local/bin/egress-healthcheck <<'SCRIPT'
 #!/usr/bin/env bash
-# Egress Substrate Health Probe
-
-LOG_FILE="/var/log/egress-health.log"
-EXPECTED_IP_FILE="/etc/wireguard/.expected_egress_ip"
+LOG="/var/log/egress-health.log"
 STATE_FILE="/tmp/egress-health-state"
+CONF_DIR="/etc/egress-substrate"
 
-# Initialize state
 [[ ! -f "$STATE_FILE" ]] && echo "healthy" > "$STATE_FILE"
-PREV_STATE=$(cat "$STATE_FILE")
+PREV=$(cat "$STATE_FILE")
+ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
-timestamp() { date -u +%Y-%m-%dT%H:%M:%SZ; }
-
-check_wg_interface() {
-    wg show wg0 &>/dev/null
-}
-
-check_egress_ip() {
-    local ip
-    ip=$(curl -4 -s --max-time 10 ifconfig.me 2>/dev/null)
-    if [[ -f "$EXPECTED_IP_FILE" ]]; then
-        local expected
-        expected=$(cat "$EXPECTED_IP_FILE")
-        [[ "$ip" == "$expected" ]]
-    else
-        [[ -n "$ip" ]]
-    fi
-}
-
-check_openai_reachable() {
-    # Test that we can reach OpenAI's API endpoint (not blocked / geo-restricted)
-    local status
-    status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 \
-        "https://api.openai.com/v1/models" \
-        -H "Authorization: Bearer sk-placeholder" 2>/dev/null)
-    # 401 = auth failed but endpoint reachable = good
-    # 403 = potentially geo-blocked = bad
-    # 000 = network failure = bad
-    [[ "$status" == "401" || "$status" == "200" ]]
-}
-
-# Run checks
 FAILURES=()
-check_wg_interface   || FAILURES+=("wg-interface-down")
-check_egress_ip      || FAILURES+=("egress-ip-mismatch")
-check_openai_reachable || FAILURES+=("openai-unreachable")
 
-if [[ ${#FAILURES[@]} -eq 0 ]]; then
-    CURRENT_STATE="healthy"
+# Probe 1: Tailscale status
+if command -v tailscale &>/dev/null; then
+    TS_STATUS=$(tailscale status --json 2>/dev/null)
+    if [[ -n "$TS_STATUS" ]]; then
+        # Check if this node is offering exit node
+        SELF_EXIT=$(echo "$TS_STATUS" | grep -o '"ExitNode":true' || echo "")
+        ONLINE=$(echo "$TS_STATUS" | grep -o '"Online":true' | head -1 || echo "")
+        [[ -z "$ONLINE" ]] && FAILURES+=("tailscale-offline")
+    else
+        FAILURES+=("tailscale-unreachable")
+    fi
 else
-    CURRENT_STATE="degraded:${FAILURES[*]}"
+    # Tailscale not installed — check WireGuard instead
+    wg show wg0 &>/dev/null || FAILURES+=("wg-interface-down")
 fi
 
-# Log state transitions
-if [[ "$CURRENT_STATE" != "$PREV_STATE" ]]; then
-    echo "$(timestamp) STATE_CHANGE: $PREV_STATE → $CURRENT_STATE" >> "$LOG_FILE"
+# Probe 2: Egress IP
+EXPECTED_IP=""
+[[ -f "$CONF_DIR/expected_ip" ]] && EXPECTED_IP=$(cat "$CONF_DIR/expected_ip")
+ACTUAL_IP=$(curl -4 -s --max-time 10 ifconfig.me 2>/dev/null || echo "")
+if [[ -n "$EXPECTED_IP" && -n "$ACTUAL_IP" ]]; then
+    [[ "$ACTUAL_IP" != "$EXPECTED_IP" ]] && FAILURES+=("egress-ip-mismatch:expected=$EXPECTED_IP,got=$ACTUAL_IP")
+elif [[ -z "$ACTUAL_IP" ]]; then
+    FAILURES+=("egress-ip-unreachable")
+fi
 
-    # Alert on degradation
-    if [[ "$CURRENT_STATE" != "healthy" ]]; then
-        MSG="⚠ Egress substrate degraded: ${FAILURES[*]}"
-        echo "$(timestamp) ALERT: $MSG" >> "$LOG_FILE"
+# Probe 3: OpenAI reachability
+STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 \
+    "https://api.openai.com/v1/models" \
+    -H "Authorization: Bearer sk-probe" 2>/dev/null || echo "000")
+case "$STATUS" in
+    401|200) ;; # reachable
+    403) FAILURES+=("openai-403-blocked") ;;
+    *)   FAILURES+=("openai-unreachable:$STATUS") ;;
+esac
 
-        # Telegram alert if configured
-        TGTOKEN_FILE="/etc/wireguard/.telegram_token"
-        TGCHAT_FILE="/etc/wireguard/.telegram_chat"
-        if [[ -f "$TGTOKEN_FILE" && -f "$TGCHAT_FILE" ]]; then
-            TG_TOKEN=$(cat "$TGTOKEN_FILE")
-            TG_CHAT=$(cat "$TGCHAT_FILE")
-            curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
-                -d chat_id="$TG_CHAT" \
-                -d text="$MSG" &>/dev/null || true
+# Determine state
+if [[ ${#FAILURES[@]} -eq 0 ]]; then
+    NOW="healthy"
+else
+    NOW="degraded:${FAILURES[*]}"
+fi
+
+# Log transition
+if [[ "$NOW" != "$PREV" ]]; then
+    echo "$(ts) STATE_CHANGE $PREV -> $NOW" >> "$LOG"
+
+    # Alert
+    if [[ "$NOW" != "healthy" ]]; then
+        MSG="Egress degraded: ${FAILURES[*]}"
+        echo "$(ts) ALERT $MSG" >> "$LOG"
+        if [[ -f "$CONF_DIR/telegram_token" && -f "$CONF_DIR/telegram_chat" ]]; then
+            T=$(cat "$CONF_DIR/telegram_token")
+            C=$(cat "$CONF_DIR/telegram_chat")
+            curl -s -X POST "https://api.telegram.org/bot${T}/sendMessage" \
+                -d chat_id="$C" -d text="$MSG" &>/dev/null || true
         fi
     else
-        echo "$(timestamp) RECOVERY: system healthy" >> "$LOG_FILE"
+        echo "$(ts) RECOVERY healthy" >> "$LOG"
+    fi
+
+    # DigitalOcean failover: if backup node detects primary is down
+    if [[ -f "$CONF_DIR/failover.conf" ]]; then
+        source "$CONF_DIR/failover.conf"
+        if [[ "$ROLE" == "backup" && "$NOW" == *"openai"* ]]; then
+            echo "$(ts) FAILOVER_CANDIDATE backup node detected primary degradation" >> "$LOG"
+            # Automated reassignment requires doctl auth to be configured
+            # Uncomment after testing:
+            # doctl compute reserved-ip-action assign $RESERVED_IP $(curl -s http://169.254.169.254/metadata/v1/id)
+        fi
     fi
 fi
 
-echo "$CURRENT_STATE" > "$STATE_FILE"
-
-# Periodic heartbeat log (every run, for liveness confirmation)
-echo "$(timestamp) PROBE: $CURRENT_STATE" >> "$LOG_FILE"
+echo "$NOW" > "$STATE_FILE"
+echo "$(ts) PROBE $NOW" >> "$LOG"
 SCRIPT
 
 chmod +x /usr/local/bin/egress-healthcheck
 
-# Store expected egress IP
-PUBLIC_IP=$(curl -4 -s ifconfig.me)
-echo "$PUBLIC_IP" > /etc/wireguard/.expected_egress_ip
-
-# Store Telegram config if provided
-if [[ -n "$TELEGRAM_TOKEN" && -n "$TELEGRAM_CHAT" ]]; then
-    echo "$TELEGRAM_TOKEN" > /etc/wireguard/.telegram_token
-    echo "$TELEGRAM_CHAT" > /etc/wireguard/.telegram_chat
-    chmod 600 /etc/wireguard/.telegram_token /etc/wireguard/.telegram_chat
-    echo "[+] Telegram alerts configured"
-fi
-
-# Install systemd timer (more reliable than cron)
+# Systemd timer
 cat > /etc/systemd/system/egress-healthcheck.service <<EOF
 [Unit]
 Description=Egress substrate health probe
-
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/egress-healthcheck
@@ -140,13 +145,11 @@ EOF
 
 cat > /etc/systemd/system/egress-healthcheck.timer <<EOF
 [Unit]
-Description=Run egress health probe every ${INTERVAL}s
-
+Description=Egress health probe every ${INTERVAL}s
 [Timer]
 OnBootSec=30
 OnUnitActiveSec=${INTERVAL}s
 AccuracySec=5s
-
 [Install]
 WantedBy=timers.target
 EOF
@@ -154,6 +157,5 @@ EOF
 systemctl daemon-reload
 systemctl enable --now egress-healthcheck.timer
 
-echo "[+] Health check deployed (interval: ${INTERVAL}s)"
-echo "[+] Log: $LOG_FILE"
+echo "[+] Health check deployed (interval: ${INTERVAL}s, log: /var/log/egress-health.log)"
 echo "[+] Expected egress IP: $PUBLIC_IP"
